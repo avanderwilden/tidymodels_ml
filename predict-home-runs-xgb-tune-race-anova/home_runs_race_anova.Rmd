@@ -2,16 +2,18 @@
 title: "Finetune Package for xgboost predict home runs"
 author: "Andrew vanderWilden"
 date: "8/12/2021"
-output: html_document
+output: pdf_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, comment = NA, message = FALSE)
+knitr::opts_chunk$set(echo = TRUE,
+                      message = F, dpi = 180, warning = F,
+                      fig.width = 8, fig.height = 5)
 ```
 
 
 
-```{r}
+```{r, echo = F}
 library(tidyverse)
 ```
 
@@ -52,7 +54,7 @@ df %>%
 
 # Build a model
 
-```{r}
+```{r, echo = F}
 library(tidymodels)
 
 tidymodels_prefer()
@@ -61,7 +63,7 @@ tidymodels_prefer()
 
 
 
-```{r}
+```{r, cache=TRUE}
 set.seed(123)
 bb_split <- df %>% 
   mutate(is_home_run = if_else(as.logical(is_home_run), 'HR', 'no'),
@@ -84,14 +86,12 @@ bb_rec <-
            is_pitcher_lefty + is_batter_lefty +
            inning + balls + strikes + game_date,
          data = bb_train) %>% 
-  step_date(game_date, features = c('week'), keep_original_cols = FALSE)# week of the year
-%>% 
+  step_date(game_date, features = c('week'), keep_original_cols = FALSE) %>% # week of the year
   step_unknown(all_nominal_predictors()) %>% 
   step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% # one hot for xgb
   step_impute_median(all_numeric_predictors(), -launch_angle, -launch_speed) %>% 
   step_impute_linear(launch_angle, launch_speed,
-                     impute_with = imp_vars(plate_x, plate_z, pitch_mph)) # use linear regression for imputing
-%>% 
+                     impute_with = imp_vars(plate_x, plate_z, pitch_mph)) %>%  # use linear regression for imputing
   step_nzv(all_predictors())
 
 # prep just to see that it works
@@ -117,7 +117,7 @@ xgb_wf <- workflow(bb_rec, xgb_spec)
 
 # Use racing to tune XGB
 
-```{r}
+```{r, cache = TRUE}
 library(finetune)
 
 # for parallel processing
@@ -140,7 +140,7 @@ xgb_res
 
 
 ```{r}
-plot_race(xgb_res)
+finetune::plot_race(xgb_res)
 ```
 
 
