@@ -1,0 +1,239 @@
+---
+title: "Sarcasm detection"
+author: "Andrew vanderWilden"
+date: "8/24/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = T,
+                      message = F, dpi = 180, warning = F,
+                      fig.width = 8, fig.height = 5)
+```
+
+
+
+```{r, echo = F}
+library(tidyverse)
+library(jsonlite)
+```
+
+This analysis uses a [kaggle dataset](https://www.kaggle.com/rmisra/news-headlines-dataset-for-sarcasm-detection) containing headlines from both The Onion and the Huffington Post.  The goal of the analysis is to try to predict if the article is a sarcastic (Onion) or real (Huffington Post) story using only the headline. We perform a lasso regression after tokenization and tfidf transformations to determine words most associated with each category.
+
+
+
+
+```{r}
+df <- tibble(stream_in(file('Sarcasm_Headlines_Dataset_v2.json')))
+```
+
+
+```{r}
+df <- df %>% 
+  mutate(is_sarcastic = factor(case_when(is_sarcastic == 1~'Sarcasm',
+                                         TRUE~'Not_Sarcasm')),
+         is_sarcastic = relevel(is_sarcastic, ref = 'Sarcasm'))
+```
+
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+```
+
+
+```{r}
+set.seed(2917)
+
+df_split <- initial_split(df, strata = is_sarcastic)
+df_train <- training(df_split)
+df_test <- testing(df_split)
+
+df_folds <- vfold_cv(df_train, strata = is_sarcastic)
+```
+
+
+
+# Lasso Model
+
+```{r}
+library(textrecipes)
+  
+sarcasm_rec <- recipe(is_sarcastic ~ ., data = df_train) %>%
+  update_role(article_link, new_role = 'link') %>% 
+  step_tokenize(headline) %>% 
+  step_stopwords(headline) %>% 
+  step_tokenfilter(headline, max_tokens = 1000) %>% 
+  step_tfidf(headline) %>% 
+  step_normalize(all_predictors())
+
+prep(sarcasm_rec)
+```
+
+
+```{r}
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine('glmnet') %>% 
+  set_mode('classification')
+```
+
+```{r}
+lasso_wf <- workflow(sarcasm_rec, lasso_spec)
+```
+
+
+## Tune parameters
+
+```{r}
+set.seed(3891)
+lasso_grid <- grid_regular(penalty(), levels = 40)
+```
+
+```{r}
+cl <- parallel::makePSOCKcluster(3)
+doParallel::registerDoParallel(cl)
+
+set.seed(181)
+
+lasso_res <- tune_grid(
+  lasso_wf,
+  resamples = df_folds,
+  grid = lasso_grid,
+  metrics = metric_set(roc_auc, npv, ppv)
+)
+
+collect_metrics(lasso_res)
+```
+
+
+
+```{r}
+lasso_res %>% 
+  collect_metrics() %>% 
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_line(size = 1.5, show.legend = FALSE) +
+  facet_wrap(~.metric) +
+  scale_x_log10()
+```
+
+
+```{r}
+best_auc <- select_best(lasso_res, 'roc_auc')
+final_lasso <- finalize_workflow(lasso_wf, best_auc)
+```
+
+
+```{r}
+train_full_fit <- final_lasso %>% 
+  fit(df_train)
+```
+
+
+
+```{r}
+train_full_fit %>% 
+  extract_fit_parsnip() %>%
+  vip::vi(lambda = best_auc$penalty) %>%
+  group_by(Sign) %>%
+  top_n(20, wt = abs(Importance)) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = str_remove(Variable, "tfidf_headline_"),
+    Variable = fct_reorder(Variable, Importance),
+    Sign = if_else(Sign == 'POS', 'Real', 'Fake')
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Sign, scales = "free_y") +
+  labs(y = NULL)
+```
+
+
+This plot shows lots of valuable information. The common phrase 'Area Man' is most associated with fake headlines. Additionally the use of swear words appear to only be associated with the Onion. This would be expected as the use of swears would almost never be allowed in a "straight news" organization. The words most associated with real stories offer hints as to were the most popular subjects to cover for the Huffington Post (Trump & lgbtq+ issues most notably). It would be interesting to re-run the analysis with news headlines from another publication i.e. NYT or WSJ to see how the results differed.
+
+
+## Results
+
+```{r}
+test_lasso <- last_fit(final_lasso, df_split)
+
+collect_metrics(test_lasso)
+```
+
+The model is able to accurately classify 73.1% of the headlines.
+
+
+```{r}
+roc_res <- roc_curve(test_lasso %>% collect_predictions(), truth = is_sarcastic,`.pred_Sarcasm`)
+
+autoplot(roc_res)
+```
+
+
+We can see the confusion matrix results below:
+
+
+```{r}
+test_lasso %>%
+  collect_predictions() %>%
+  conf_mat(is_sarcastic, .pred_class)
+```
+
+
+
+
+And the same information presented visually:
+
+
+
+
+```{r}
+test_lasso %>%
+  collect_predictions() %>%
+  conf_mat(is_sarcastic, .pred_class) %>% 
+  autoplot()
+```
+
+
+
+
+```{r}
+z <- augment(train_full_fit, df_train) %>% 
+  select(-article_link)
+
+```
+
+
+
+
+We can also see a small sample of the headlines and the associated predictions:
+
+
+
+
+```{r}
+set.seed(1948)
+
+knitr::kable(z %>% 
+  sample_n(10), format = 'latex', booktabs = TRUE) %>% 
+  kableExtra::kable_styling(latex_options = c('hold_position',
+                                              'scale_down'))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
