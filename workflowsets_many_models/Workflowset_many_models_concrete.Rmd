@@ -1,0 +1,394 @@
+---
+title: "Concrete Strength Many Models Workflowsets"
+author: "Andrew vanderWilden"
+date: "8/26/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = F,
+                      message = F, dpi = 180, warning = F,
+                      fig.width = 8, fig.height = 5)
+```
+
+
+```{r, echo = F}
+library(tidyverse)
+library(tidymodels)
+tidymodels_prefer()
+```
+
+Working through chapter 15 of [Tidy Modeling with R](https://www.tmwr.org/).
+
+
+# Modeling Concrete Strength
+
+```{r}
+data(concrete,package = 'modeldata')
+glimpse(concrete)
+```
+
+
+`compressive_strength` is the outcome. The `age` predictor tells us the age of the concrete sample at testing in days. The rest of the predictors are components of concrete in units of kilograms per cubic meter
+
+
+There are some cases where the same formula was tested multiple times. To address this we can use the mean compressive strength per cubic meter:
+
+```{r}
+concrete <- concrete %>% 
+  group_by(cement, blast_furnace_slag, fly_ash, water,
+           superplasticizer, coarse_aggregate, fine_aggregate, age) %>% 
+  summarise(compressive_strength = mean(compressive_strength),
+            .groups = 'drop')
+nrow(concrete)
+```
+
+
+Lets split the data and create cross-validation folds:
+
+```{r}
+set.seed(1501)
+
+concrete_split <- initial_split(concrete, strata = compressive_strength)
+concrete_train <- training(concrete_split)
+concrete_test <- testing(concrete_split)
+
+set.seed(1502)
+concrete_folds <-
+  vfold_cv(concrete_train, strata = compressive_strength, repeats = 5)
+```
+
+
+
+Some models (nnet, knn, svm) require centering and scaling. For others a response surface design (quadratic or two way interaction) is a good idea. We can create two recipes:
+
+```{r}
+normalized_rec <-
+  recipe(compressive_strength ~ .,data = concrete_train) %>% 
+  step_normalize(all_predictors())
+
+poly_rec <-
+  normalized_rec %>% 
+  step_poly(all_predictors()) %>% 
+  step_interact(~all_predictors():all_predictors())
+```
+
+
+
+We can then create a bunch of model specifications:
+
+```{r, echo=F}
+library(rules)
+library(baguette)
+```
+
+
+```{r}
+linear_reg_spec <-
+  linear_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine('glmnet')
+
+nnet_spec <-
+  mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>% 
+  set_engine('nnet', MaxNWts = 2600) %>% 
+  set_mode('regression')
+
+mars_spec <-
+  mars(prod_degree = tune()) %>% 
+  set_engine('earth') %>% 
+  set_mode('regression')
+
+svm_r_rec <-
+  svm_rbf(cost = tune(), rbf_sigma = tune()) %>% 
+  set_engine('kernlab') %>% 
+  set_mode('regression')
+
+svm_p_spec <-
+  svm_poly(cost = tune(), degree = tune()) %>% 
+  set_engine('kernlab') %>% 
+  set_mode('regression')
+
+knn_spec <-
+  nearest_neighbor(neighbors = tune(),
+                   dist_power = tune(), weight_func = tune()) %>% 
+  set_engine('kknn') %>% 
+  set_mode('regression')
+
+cart_spec <-
+  decision_tree(cost_complexity = tune(), min_n = tune()) %>% 
+  set_engine('rpart') %>% 
+  set_mode('regression')
+
+bag_cart_spec <-
+  bag_tree() %>% 
+  set_engine('rpart', times = 50L) %>% 
+  set_mode('regression')
+
+rf_spec <-
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
+  set_engine('ranger') %>% 
+  set_mode('regression')
+
+xgb_spec <-
+  boost_tree(tree_depth = tune(), learn_rate = tune(),
+             loss_reduction = tune(), min_n = tune(),
+             sample_size = tune(), trees = tune()) %>% 
+  set_engine('xgboost') %>% 
+  set_mode('regression')
+
+cubist_spec <-
+  cubist_rules(committees = tune(), neighbors = tune()) %>% 
+  set_engine('Cubist')
+```
+
+
+Neural networks should have up to 27 hidden units in a layer. The `parameters()` function creates a parameter set we can modify to have the correct range:
+
+```{r}
+nnet_param <- 
+  nnet_spec %>% 
+  parameters() %>% 
+  update(hidden_units = hidden_units(range = c(1,27)))
+```
+
+
+# Creating the workflow set
+
+
+As a first example we can combine the recipe that only standardizes the predictors to the nonlinear models that require the predictors be the same units:
+
+```{r}
+normalized <-
+  workflow_set(
+    preproc = list(normalized = normalized_rec),
+    models = list(SVM_radial = svm_r_rec, SVM_poly = svm_p_spec,
+                  KNN = knn_spec, neural_network = nnet_spec)
+  )
+normalized
+```
+
+
+If the preprocessors contained more than one value, the function would create all combinations of preprocessors and models.
+
+Workflows can be extracted:
+
+```{r}
+normalized %>% extract_workflow(id = 'normalized_KNN')
+```
+
+
+The `option` column is a placeholder for arguments to use when we evaluate the workflow. We can add the nnet parameter object:
+
+```{r}
+normalized <-
+  normalized %>% 
+  option_add(param = nnet_param, id = 'normalized_neural_network')
+normalized
+```
+
+
+For the other nonlinear models we can create another workflow set for the outcomes and predictors:
+
+```{r}
+model_vars <-
+  workflow_variables(outcomes = compressive_strength,
+                     predictors = everything())
+
+no_pre_proc <-
+  workflow_set(
+    preproc = list(simple = model_vars),
+    models = list(MARS = mars_spec, CART = cart_spec,
+                  CART_bagged = bag_cart_spec, RF = rf_spec,
+                  boosting = xgb_spec, Cubist = cubist_spec))
+
+no_pre_proc
+```
+
+
+Finally the set that uses nonlinear terms and interactions:
+
+```{r}
+with_features <-
+  workflow_set(
+    preproc = list(full_quad = poly_rec),
+    models = list(linear_reg = linear_reg_spec, KNN = knn_spec)
+  )
+with_features
+```
+
+
+We can then bind all these together:
+
+
+```{r}
+all_workflows <-
+  bind_rows(no_pre_proc, normalized, with_features) %>% 
+  # Make the workflow ids a little more simple
+  mutate(wflow_id = gsub('(simple_)|(normalized_)', '', wflow_id))
+all_workflows
+```
+
+
+# Tuning and evaluating the models
+
+
+```{r, echo=FALSE}
+library(finetune)
+```
+
+```{r}
+cl <- parallel::makePSOCKcluster(4)
+doParallel::registerDoParallel(cl)
+
+grid_control <-
+  control_grid(save_pred = T,
+               parallel_over = 'everything',
+               save_workflow = T)
+
+full_results_time <-
+  system.time(
+    grid_results <-
+      all_workflows %>% 
+      workflow_map(
+        seed = 1503,
+        resamples = concrete_folds,
+        grid = 25,
+        control = grid_control,
+        verbose = T
+      )
+  )
+```
+
+
+
+```{r}
+grid_results %>% 
+  rank_results() %>% 
+  filter(.metric == 'rmse') %>% 
+  select(model, .config, rmse = mean, rank)
+```
+
+```{r}
+autoplot(
+  grid_results,
+  rank_metric = 'rmse',
+  metric = 'rmse',
+  select_best = TRUE
+) +
+  theme_minimal() +
+  theme(legend.position = 'top')
+```
+
+
+
+```{r}
+autoplot(grid_results, id = 'Cubist', metric = 'rmse')
+```
+
+
+# Anova tuning
+
+```{r}
+cl <- parallel::makePSOCKcluster(4)
+doParallel::registerDoParallel(cl)
+
+race_control <-
+  control_race(save_pred = T,
+               parallel_over = 'everything',
+               save_workflow = T)
+
+full_results_time <-
+  system.time(
+    race_results <-
+      all_workflows %>% 
+      workflow_map(
+        'tune_race_anova',
+        seed = 1506,
+        resamples = concrete_folds,
+        grid = 25,
+        control = race_control,
+        verbose = T
+      )
+  )
+```
+
+
+
+
+```{r}
+autoplot(
+  race_results,
+  rank_metric = 'rmse',
+  metric = 'rmse',
+  select_best = TRUE
+) +
+  theme_minimal() +
+  theme(legend.position = 'top')
+```
+
+
+```{r}
+autoplot(grid_results, id = 'boosting', metric = 'rmse')
+```
+
+
+
+
+```{r}
+matched_results <-
+  rank_results(race_results, select_best = T) %>% 
+  select(wflow_id, .metric, race = mean, config_race = .config) %>% 
+  inner_join(
+    rank_results(grid_results, select_best = T) %>% 
+      select(wflow_id, .metric, complete = mean,
+             config_complete = .config, model),
+    by = c('wflow_id', '.metric')
+  ) %>% 
+  filter(.metric == 'rmse')
+
+matched_results %>% 
+  ggplot(aes(complete, race)) +
+  geom_abline(lty = 3) +
+  geom_point(aes(color = model)) +
+  coord_obs_pred() +
+  labs(x = 'Complete Grid RMSE', y = 'Racing RMSE') +
+  theme_minimal()
+```
+
+
+# Finalizing a model
+
+```{r}
+best_results <-
+  race_results %>% 
+  extract_workflow_set_result('boosting') %>% 
+  select_best(metric = 'rmse')
+best_results
+```
+
+```{r}
+boosting_test_results <-
+  race_results %>% 
+  extract_workflow('boosting') %>% 
+  finalize_workflow(best_results) %>% 
+  last_fit(concrete_split)
+
+collect_metrics(boosting_test_results)
+```
+
+```{r}
+boosting_test_results %>% 
+  collect_predictions() %>% 
+  ggplot(aes(compressive_strength,.pred)) +
+  geom_abline(lty = 2, color = 'green') +
+  geom_point(alpha = 0.5) +
+  coord_obs_pred() +
+  labs(x = 'Observed', y = 'Predicted') +
+  theme_minimal()
+```
+
+
+
+
+
+
