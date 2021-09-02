@@ -146,16 +146,6 @@ test_df <- read_csv('test.csv')
 
 
 
-```{r}
-baked_test <- bake(prepped_rec, test_df)
-```
-
-
-
-
-```{r}
-model <- extract_fit_parsnip(xgb_last)
-```
 
 ```{r}
 fin_fit <- xgb_wf %>% 
@@ -164,12 +154,6 @@ fin_fit <- xgb_wf %>%
 ```
 
 
-
-
-
-```{r}
-asdf <- predict(fin_fit, test_df, 'prob')
-```
 
 
 ```{r}
