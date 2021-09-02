@@ -1,0 +1,202 @@
+---
+title: "September Tabular Playground Kaggle"
+author: "Andrew vanderWilden"
+date: "9/2/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = F,
+                      message = F, dpi = 180, warning = F,
+                      fig.width = 8, fig.height = 5)
+```
+
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(finetune)
+tidymodels_prefer()
+```
+
+
+```{r}
+df <- read_csv('train.csv')
+```
+
+```{r}
+df <- df %>% 
+  mutate(claim = as_factor(claim),
+         claim = relevel(claim, ref = '0'))
+```
+
+
+```{r}
+df %>% count(claim)
+```
+
+
+```{r}
+set.seed(1917)
+
+df_split <- initial_split(df, strata = claim)
+df_train <- training(df_split)
+df_test <- testing(df_split)
+
+set.seed(992)
+
+df_folds <- vfold_cv(df_train, strata = claim)
+```
+
+
+
+```{r}
+cl <- parallel::makePSOCKcluster(3)
+doParallel::registerDoParallel(cl)
+```
+
+
+
+```{r}
+xgb_rec <- recipe(claim~., data = df_train) %>% 
+  update_role(id, new_role = 'id') %>% 
+  step_impute_median(all_numeric_predictors()) %>% 
+  step_nzv(all_predictors())
+
+prep(xgb_rec)
+```
+
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 500,
+  mtry = tune(),
+  min_n = tune(),
+  learn_rate = 0.01,
+  stop_iter = tune()
+) %>% 
+  set_engine('xgboost') %>% 
+  set_mode('classification')
+
+
+xgb_wf <- workflow(xgb_rec, xgb_spec)
+```
+
+
+```{r}
+set.seed(472)
+
+
+results_time <-
+  system.time(
+    xgb_res <- xgb_wf %>% 
+    tune_race_anova(
+      resamples = df_folds,
+      grid = 15,
+      metrics = metric_set(roc_auc),
+      control = control_race(verbose_elim = TRUE)
+  ))
+```
+
+
+
+```{r}
+plot_race(xgb_res)
+```
+
+
+```{r}
+show_best(xgb_res, n = 5)
+```
+
+# Final Fit for training
+
+```{r}
+xgb_last <- xgb_wf %>% 
+  finalize_workflow(select_best(xgb_res, 'roc_auc')) %>% 
+  last_fit(df_split)
+```
+
+
+
+
+
+```{r}
+collect_metrics(xgb_last)
+```
+
+
+
+```{r}
+roc_res <- roc_curve(xgb_last %>% collect_predictions(), truth = claim,.pred_0)
+autoplot(roc_res)
+
+```
+
+
+```{r}
+prepped_rec <- prep(xgb_rec, retain = FALSE)
+```
+
+
+
+```{r}
+test_df <- read_csv('test.csv')
+```
+
+
+
+```{r}
+baked_test <- bake(prepped_rec, test_df)
+```
+
+
+
+
+```{r}
+model <- extract_fit_parsnip(xgb_last)
+```
+
+```{r}
+fin_fit <- xgb_wf %>% 
+  finalize_workflow(select_best(xgb_res, 'roc_auc')) %>% 
+  fit(df_train)
+```
+
+
+
+
+
+```{r}
+asdf <- predict(fin_fit, test_df, 'prob')
+```
+
+
+```{r}
+z <- augment(fin_fit, test_df)
+
+head(z)
+```
+
+
+```{r}
+z <- z %>% 
+  select(id, .pred_class, .pred_0, .pred_1)
+
+head(z)
+```
+
+```{r}
+z <- z %>% 
+  select(id, .pred_1) %>% 
+  rename(claim = .pred_1)
+
+head(z)
+```
+
+
+```{r}
+write_csv(z, 'sep_sub_1.csv')
+```
+
+
