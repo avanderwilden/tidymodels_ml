@@ -1,0 +1,155 @@
+---
+title: "September Kaggle - Neural Network"
+author: "Andrew vanderWilden"
+date: "9/6/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = F,
+                      message = F, dpi = 180, warning = F,
+                      fig.width = 8, fig.height = 5)
+```
+
+
+```{r, echo = F}
+library(tidyverse)
+library(tidymodels)
+library(finetune)
+tidymodels_prefer()
+```
+
+
+```{r}
+df <- read_csv('train.csv')
+```
+
+
+```{r}
+df <- df %>% 
+  mutate(claim = as_factor(claim),
+         claim = relevel(claim, ref = '1'))
+```
+
+
+```{r}
+set.seed(2057)
+
+df_split <- initial_split(df, strata = claim)
+df_train <- training(df_split)
+df_test <- testing(df_split)
+
+set.seed(4582)
+
+df_folds <- vfold_cv(df_train, strata = claim)
+```
+
+
+
+```{r}
+nnet_rec <- recipe(claim~., data = df_train) %>% 
+  update_role(id, new_role = 'id') %>% 
+  step_impute_median(all_numeric_predictors()) %>% 
+  step_corr(all_predictors(), threshold = 0.9) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_pca(all_numeric_predictors(), threshold = 0.75)
+
+```
+
+
+```{r}
+nnet_spec <- mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>% 
+  set_engine('nnet', MaxNWts = 2600) %>% 
+  set_mode('classification')
+```
+
+
+```{r}
+nnet_wf <- workflow(nnet_rec, nnet_spec)
+```
+
+
+```{r}
+cl <- parallel::makePSOCKcluster(3)
+doParallel::registerDoParallel(cl)
+
+set.seed(4729)
+
+nnet_res <- tune_race_anova(
+  nnet_wf,
+  resamples = df_folds,
+  grid = 15,
+  metrics = metric_set(roc_auc),
+  control = control_race(verbose_elim = TRUE)
+)
+```
+
+
+```{r}
+plot_race(nnet_res)
+```
+
+
+```{r}
+show_best(nnet_res)
+```
+
+
+
+```{r}
+best_auc <- select_best(nnet_res, 'roc_auc')
+```
+
+```{r}
+final_wf <- nnet_wf %>% 
+  finalize_workflow(best_auc)
+```
+
+```{r}
+full_train_fit <- fit(final_wf, data = df_train)
+```
+
+
+
+```{r}
+test_df <- read_csv('test.csv')
+```
+
+
+
+```{r}
+z <- augment(full_train_fit, test_df)
+
+head(z)
+```
+
+
+```{r}
+z <- z %>% 
+  select(id, .pred_class, .pred_0, .pred_1)
+
+head(z)
+```
+
+```{r}
+z <- z %>% 
+  select(id, .pred_1) %>% 
+  rename(claim = .pred_1)
+
+head(z)
+```
+
+
+```{r}
+write_csv(z, 'sep_sub_2.csv')
+```
+
+
+
+
+
+
+
+
+
