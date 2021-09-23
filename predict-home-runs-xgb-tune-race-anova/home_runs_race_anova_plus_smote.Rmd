@@ -1,0 +1,282 @@
+---
+title: "Finetune Package for xgboost predict home runs"
+author: "Andrew vanderWilden"
+date: "8/12/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = F, dpi = 180, warning = F,
+                      fig.width = 8, fig.height = 5)
+```
+
+
+
+```{r, echo = F}
+library(tidyverse)
+```
+
+
+
+
+```{r}
+df <- read_csv('train_home_run.csv')
+```
+
+
+
+How are home runs distributed in the physical space around home plate? Is it different for righties and lefties?
+
+```{r}
+df %>% 
+  mutate(is_batter_lefty = if_else(is_batter_lefty == 1, 'Lefty', 'Righty')) %>% 
+  ggplot(aes(plate_x, plate_z, z = is_home_run)) +
+  facet_wrap(~is_batter_lefty) +
+  stat_summary_hex(alpha = .8, bins = 10) +
+  scale_fill_viridis_c(labels = scales::percent_format()) +
+  labs(fill = '% home run')
+  
+```
+
+
+
+What about launch angle and velocity?
+
+```{r}
+df %>% 
+  ggplot(aes(launch_angle, launch_speed, z = is_home_run)) +
+  stat_summary_hex(alpha = 0.8, bins = 15) +
+  scale_fill_viridis_c(labels = scales::percent_format()) +
+  labs(fill = '% home run')
+```
+
+
+# Build a model
+
+```{r, echo = F}
+library(tidymodels)
+library(themis)
+tidymodels_prefer()
+options(tidymodels.dark = TRUE)
+```
+
+
+
+
+```{r, cache=TRUE}
+set.seed(123)
+bb_split <- df %>% 
+  mutate(is_home_run = if_else(as.logical(is_home_run), 'HR', 'no'),
+         is_home_run = factor(is_home_run)) %>% 
+  initial_split(strata = is_home_run)
+
+bb_train <- training(bb_split)
+bb_test <- testing(bb_split)
+
+set.seed(234)
+bb_folds <- vfold_cv(bb_train, strata = is_home_run)
+bb_folds
+```
+
+
+```{r}
+bb_rec <- 
+  recipe(is_home_run ~ launch_angle + launch_speed + plate_x + plate_z +
+           bb_type + bearing + pitch_mph +
+           is_pitcher_lefty + is_batter_lefty +
+           inning + balls + strikes + game_date,
+         data = bb_train) %>% 
+  step_date(game_date, features = c('week'), keep_original_cols = FALSE) %>% # week of the year
+  step_unknown(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% # one hot for xgb
+  step_impute_median(all_numeric_predictors(), -launch_angle, -launch_speed) %>% 
+  step_impute_linear(launch_angle, launch_speed,
+                     impute_with = imp_vars(plate_x, plate_z, pitch_mph)) %>%  # use linear regression for imputing
+  step_nzv(all_predictors())
+
+smote_rec <- bb_rec %>% 
+  step_smote(is_home_run)
+
+# prep just to see that it works
+prep(bb_rec)
+```
+
+
+
+```{r}
+xgb_spec <- 
+  boost_tree(
+    trees = tune(),
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),
+    sample_size = tune()
+  ) %>% 
+  set_engine('xgboost') %>% 
+  set_mode('classification')
+
+xgb_params <- parameters(xgb_spec)
+
+xgb_wf <- workflow(bb_rec, xgb_spec)
+smote_wf <- workflow(smote_rec, xgb_spec)
+```
+
+
+```{r}
+set.seed(917)
+xgb_grid <- grid_latin_hypercube(xgb_params, size = 25)
+```
+
+
+
+
+# Use racing to tune XGB
+
+```{r}
+library(finetune)
+
+# for parallel processing
+cl <- parallel::makePSOCKcluster(4)
+doParallel::registerDoParallel(cl)
+
+set.seed(345)
+# anova tuning eliminates obviously bad sets of params after a few resamples saving time and computing power
+xgb_res <- tune_race_anova(
+  xgb_wf,
+  resamples = bb_folds,
+  grid = xgb_grid,
+  metrics = metric_set(mn_log_loss),
+  control = control_race(verbose = T, verbose_elim = T)
+)
+
+xgb_res
+```
+
+
+
+```{r}
+finetune::plot_race(xgb_res)
+```
+
+
+
+
+```{r}
+show_best(xgb_res, metric = 'mn_log_loss')
+```
+
+
+
+
+```{r}
+# for parallel processing
+cl <- parallel::makePSOCKcluster(4)
+doParallel::registerDoParallel(cl)
+
+set.seed(639)
+# anova tuning eliminates obviously bad sets of params after a few resamples saving time and computing power
+smote_res <- tune_race_anova(
+  smote_wf,
+  resamples = bb_folds,
+  grid = xgb_grid,
+  metrics = metric_set(mn_log_loss),
+  control = control_race(verbose = TRUE, verbose_elim = TRUE)
+)
+
+smote_res
+```
+
+```{r}
+finetune::plot_race(smote_res)
+```
+
+
+
+
+```{r}
+show_best(smote_res, metric = 'mn_log_loss')
+```
+
+
+## Final Fit
+
+```{r}
+xgb_last <- xgb_wf %>% 
+  finalize_workflow(select_best(xgb_res, 'mn_log_loss')) %>% 
+  last_fit(bb_split)
+
+xgb_last
+```
+
+
+
+```{r}
+collect_metrics(xgb_last)
+```
+
+
+
+```{r}
+smote_last <- smote_wf %>% 
+  finalize_workflow(select_best(smote_res, 'mn_log_loss')) %>% 
+  last_fit(bb_split)
+
+smote_last
+```
+
+
+
+```{r}
+collect_metrics(smote_last)
+```
+
+
+
+```{r}
+xgb_last %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = is_home_run, estimate = .pred_class)
+```
+
+
+```{r}
+smote_last %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = is_home_run, estimate = .pred_class)
+```
+
+
+
+
+
+
+
+```{r}
+mean(df$is_home_run)
+```
+
+
+```{r}
+roc_res <- roc_curve(xgb_last %>% collect_predictions(), truth = is_home_run,.pred_HR)
+
+autoplot(roc_res)
+```
+
+
+
+```{r}
+# variable importance plot
+library(vip)
+extract_workflow(xgb_last) %>% 
+  extract_fit_parsnip() %>% 
+  vip(geom = 'point', num_features = 15)
+```
+
+
+
+
+
+
+
