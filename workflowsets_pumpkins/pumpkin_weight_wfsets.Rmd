@@ -1,0 +1,227 @@
+---
+title: 'TidyTuesday Pumpkin Weight: Workflowsets'
+author: "Andrew vanderWilden"
+date: "10/22/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = F, dpi = 180, warning = F,
+                      fig.width = 8, fig.height = 5)
+```
+
+
+```{r}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(tidymodels))
+options(tidymodels.dark = TRUE)
+```
+
+
+```{r}
+# pumpkins_raw <- readr::read_csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-10-19/pumpkins.csv")
+
+pumpkins_raw <- read_csv('pumpkins.csv')
+```
+
+
+
+# Explore Data
+
+```{r}
+pumpkins <- 
+  pumpkins_raw %>% 
+  separate(id, into = c('year', 'type')) %>% 
+  mutate(across(c(year,weight_lbs, ott, place), parse_number)) %>% 
+  filter(type == 'P') %>% 
+  select(weight_lbs, year, place, ott, gpc_site, country)
+```
+
+
+**OTT is "over-the-top inches" (size of pumpkin).**
+
+```{r}
+pumpkins %>% 
+  filter(ott > 20, ott < 1e3) %>% 
+  ggplot(aes(ott, weight_lbs, color = place)) +
+  geom_point(alpha = 0.2, size = 1.1) +
+  labs(x = 'over-the-top inches', y = 'weight (lbs)') +
+  scale_color_viridis_c() +
+  theme_minimal()
+```
+
+
+Big Heavy pumpkins tend to win! (As we would expect)
+
+Has there been a change over time?
+
+```{r}
+pumpkins %>% 
+  filter(ott > 20, ott < 1e3) %>% 
+  ggplot(aes(ott, weight_lbs)) +
+  geom_point(alpha = 0.2, size = 1.1, color = 'gray 60') +
+  geom_smooth(aes(color = factor(year)),
+              method = 'lm', formula = y~splines::bs(x,3),
+              se = F, size = 1.5, alpha = 0.6) +
+  labs(x = 'over-the-top inches', y = 'weight (lbs)', color = NULL) +
+  scale_color_viridis_d() +
+  theme_minimal()
+```
+
+
+Hard to draw any definitive conclusions.
+
+Which countries produced the largest pumpkins?
+
+```{r}
+pumpkins %>% 
+  mutate(
+    country = fct_lump(country, n = 10),
+    country = fct_reorder(country, weight_lbs)
+  ) %>% 
+  ggplot(aes(country, weight_lbs, color = country)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_jitter(alpha = 0.1, width = 0.15) +
+  labs(x = NULL, y = 'weight (lbs)') +
+  theme_minimal() +
+  theme(legend.position = 'none')
+```
+
+
+
+# Build a workflow set
+
+
+```{r}
+set.seed(9171)
+
+pumpkin_split <-
+  pumpkins %>% 
+  filter(ott > 20, ott < 1e3) %>% 
+  initial_split(strata = weight_lbs)
+
+pumpkin_train <- training(pumpkin_split)
+pumpkin_test <- testing(pumpkin_split)
+
+set.seed(269)
+
+pumpkin_folds <-
+  vfold_cv(pumpkin_train, strata = weight_lbs)
+```
+
+
+We will create three recipes, each building on the previous:
+
+1. Pool infrequent factor levels together
+2. Create indicator (dummy) variables
+3. Create spline terms for OTT
+
+```{r}
+base_rec <- recipe(weight_lbs~ott + year + country + gpc_site,
+                   data = pumpkin_train) %>% 
+  step_other(country, gpc_site, threshold = 0.02)
+
+ind_rec <- base_rec %>% 
+  step_dummy(all_nominal_predictors())
+
+spline_rec <- ind_rec %>% 
+  step_bs(ott)
+```
+
+
+
+We will create three types of models:
+
+1. Random Forest
+2. MARS
+3. Linear Regression
+
+```{r}
+rf_spec <- rand_forest(trees = 1e3) %>% 
+  set_engine('ranger') %>% 
+  set_mode('regression')
+
+mars_spec <- mars() %>% 
+  set_engine('earth') %>% 
+  set_mode('regression')
+
+lm_spec <- linear_reg()
+```
+
+
+
+We put then put them together in a workflow set:
+
+```{r}
+pumpkin_set <- 
+  workflow_set(
+    list(base_rec, ind_rec,spline_rec),
+    list(rf_spec,mars_spec,lm_spec),
+    cross = FALSE
+  )
+
+pumpkin_set
+```
+
+
+We use `cross = FALSE` because we only want the 3 models, if we said `cross = TRUE` it would fit 9 models, each recipe to each model.
+
+
+We then fit the models:
+
+```{r}
+doParallel::registerDoParallel()
+set.seed(4736)
+
+pumpkin_rs <-
+  workflow_map(
+    pumpkin_set,
+    'fit_resamples',
+    resamples = pumpkin_folds
+  )
+
+pumpkin_rs
+```
+
+
+
+# Evaluate the models
+
+How did they do?
+
+```{r}
+autoplot(pumpkin_rs) +
+  theme_minimal()
+```
+
+
+
+Not a ton of difference but the linear model with splines appears to perform best. This is also good news because it is the simplest of the models.
+
+We can then extract the model and fit we want to use:
+
+```{r}
+final_fit <-
+  extract_workflow(pumpkin_rs, 'recipe_3_linear_reg') %>% 
+  fit(pumpkin_train)
+```
+
+
+```{r}
+tidy(final_fit) %>% 
+  arrange(-abs(estimate))
+```
+
+
+```{r}
+last_fit <-
+  extract_workflow(pumpkin_rs, 'recipe_3_linear_reg') %>% 
+  last_fit(pumpkin_split)
+
+collect_metrics(last_fit)
+```
+
+
+
+
